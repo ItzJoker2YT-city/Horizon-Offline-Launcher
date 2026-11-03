@@ -331,6 +331,22 @@ fn release_list() -> Result<serde_json::Value, String> {
     get(&url)?.into_json().map_err(|e| e.to_string())
 }
 
+/// Every published release of Horizon's own repository: where the game's builds come from.
+fn upstream_release_list() -> Result<serde_json::Value, String> {
+    let url = format!("https://api.github.com/repos/{UPSTREAM_REPO}/releases?per_page=100");
+    get(&url)?.into_json().map_err(|e| e.to_string())
+}
+
+/// Horizon's releases joined with this repository's: the Versions page lists the game's builds
+/// from Horizon (its Nightlies) next to this fork's, while the launcher's updates stay here.
+fn merged_release_list() -> Result<serde_json::Value, String> {
+    let mut list = upstream_release_list()?;
+    if let (Some(out), Ok(extra)) = (list.as_array_mut(), release_list()) {
+        out.extend(extra.as_array().cloned().unwrap_or_default());
+    }
+    Ok(list)
+}
+
 /// The releases in `list` whose tag passes `keep`, newest first, with the asset named `asset`.
 pub(crate) fn parse_releases(
     list: &serde_json::Value,
@@ -378,7 +394,7 @@ fn is_launcher_tag(tag: &str) -> bool {
 /// 2026-10-28, docs/release-flow.md), the last week's Nightlies, then the releases from before.
 /// Drafts never reach the anonymous API, and launcher releases are left out.
 pub fn releases() -> Result<Vec<Release>, String> {
-    Ok(game_releases(&release_list()?))
+    Ok(game_releases(&merged_release_list()?))
 }
 
 /// The game's builds in `list`, newest first. A Nightly is listed under the version it installs as
@@ -698,13 +714,28 @@ pub(crate) fn fetch_small(url: &str) -> Result<Option<Vec<u8>>, String> {
 }
 
 /// The SHA-256 the release's signed checksums give for `asset`, or why it must not be installed.
-fn signed_digest(tag: &str, asset: &str) -> Result<String, String> {
-    crate::signed::digest(
+fn signed_digest(repo: &str, tag: &str, asset: &str) -> Result<String, String> {
+    crate::signed::digest_from(
+        repo,
         tag,
         asset,
         &horizon_release_sign::trusted_keys(),
         fetch_small,
     )
+}
+
+/// The repository a release's files download from: its asset URL's owner/repo. Horizon's builds
+/// are checked against Horizon's checksums, this fork's against its own.
+fn release_repo(release: &Release) -> String {
+    release
+        .asset
+        .as_ref()
+        .and_then(|(url, _)| {
+            url.strip_prefix("https://github.com/")?
+                .split_once("/releases/download/")
+                .map(|(repo, _)| repo.to_owned())
+        })
+        .unwrap_or_else(|| REPO.to_owned())
 }
 
 /// Downloads `url` into `to`; the file is kept only if its SHA-256 is `sha256`, the signed (or
@@ -763,15 +794,17 @@ fn unpack(archive: &Path, url: &str, to: &Path) -> Result<(), String> {
 /// the fraction done.
 pub fn install(release: &Release, progress: impl Fn(f32)) -> Result<(), String> {
     let tag = release.tag.as_str();
+    let repo = release_repo(release);
     let sha256 = match &release.nightly {
         // Signed for the Nightly channel, served under its own GitHub tag.
-        Some(published) => crate::signed::nightly_digest(
+        Some(published) => crate::signed::nightly_digest_from(
+            &repo,
             published,
             ASSET.unwrap_or_default(),
             &horizon_release_sign::trusted_keys(),
             fetch_small,
         )?,
-        None if is_game_tag(tag) => signed_digest(tag, ASSET.unwrap_or_default())?,
+        None if is_game_tag(tag) => signed_digest(&repo, tag, ASSET.unwrap_or_default())?,
         None => return Err(format!("{tag} is not a Horizon release.")),
     };
     install_as(release, tag, &sha256, progress)
@@ -2585,7 +2618,7 @@ fn launcher_update_from(releases: &[Release], own: &str) -> Option<Release> {
 pub fn releases_and_updates(
     on_releases: impl FnOnce(Result<Vec<Release>, String>),
 ) -> Result<Updates, String> {
-    releases_and_updates_with(release_list, installed, launcher_releases_in, on_releases)
+    releases_and_updates_with(merged_release_list, installed, launcher_releases_in, on_releases)
 }
 
 fn releases_and_updates_with(
@@ -2905,7 +2938,7 @@ pub fn self_update(release: &Release, progress: impl Fn(f32)) -> Result<(), Stri
         progress(1.0);
         return Ok(());
     }
-    let sha256 = signed_digest(&release.tag, launcher_asset().unwrap_or_default())?;
+    let sha256 = signed_digest(REPO, &release.tag, launcher_asset().unwrap_or_default())?;
     let work = data_dir().join(".launcher-update");
     let _ = fs::remove_dir_all(&work);
     fs::create_dir_all(&work).map_err(|e| e.to_string())?;
