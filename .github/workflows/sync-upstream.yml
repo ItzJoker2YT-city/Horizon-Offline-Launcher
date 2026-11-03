@@ -1,0 +1,67 @@
+# Keeps this fork one patch ahead of gerdaroot: when they publish a newer launcher@ release, this
+# syncs the fork to that release's tree, re-applies the fork's changes, and pushes a launcher@<version>
+# tag so the launcher workflow builds, signs and publishes it. When the patch no longer applies, it
+# opens an issue instead of staying quiet.
+name: sync-upstream
+
+on:
+  schedule:
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Skip when this fork already has gerdaroot's newest launcher
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          upstream=$(gh api "repos/gerdaroot/Horizon-Offline-Launcher/releases/latest" --jq .tag_name | sed 's/^launcher@//')
+          fork_newest=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --jq '.[].tag_name' \
+            | grep '^launcher@' | sed 's/^launcher@//; s/-patch[0-9]*$//' | sort -V | tail -1 || true)
+          echo "upstream=$upstream fork_newest=${fork_newest:-none}"
+          if [ -n "$fork_newest" ] && [ "$(printf '%s\n' "$fork_newest" "$upstream" | sort -V | tail -1)" = "$fork_newest" ]; then
+            echo "This fork already has gerdaroot's newest launcher. Nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "version=$upstream" >> "$GITHUB_OUTPUT"
+      - name: Sync to gerdaroot's tree and re-apply this fork's changes
+        id: sync
+        if: steps.pick.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          version="${{ steps.pick.outputs.version }}"
+          cp .github/patch/horizon-upstream-nightlies.patch /tmp/fork-patch.diff
+          git remote add upstream https://github.com/gerdaroot/Horizon-Offline-Launcher.git
+          git fetch upstream "refs/tags/launcher@$version:refs/tags/upstream-launcher" --no-tags
+          git reset --hard upstream-launcher
+          git apply --3way /tmp/fork-patch.diff
+          git add -A
+          git -c user.name="patch-bot" -c user.email="actions@users.noreply.github.com" \
+            commit -m "launcher $version with Horizon's nightlies patch"
+          git push origin HEAD:main
+          git tag "launcher@$version"
+          git push origin "launcher@$version"
+      - name: Open an issue when the patch no longer applies
+        if: failure() && steps.sync.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create --repo "${GITHUB_REPOSITORY}" \
+            --title "Patch needs a rebase for gerdaroot's latest launcher" \
+            --body "The automatic sync found gerdaroot's newest launcher release, but horizon-upstream-nightlies.patch no longer applies cleanly to it. Re-apply the edits by hand, or ask Notion AI to redo them."
