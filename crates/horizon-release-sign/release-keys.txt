@@ -2,3 +2,9 @@
 # base64 Ed25519 key per line. The launcher and horizon-server build these in and refuse a download no key here
 # signed. The private key exists only as the RELEASE_SIGNING_KEY secret of gerdaroot/Horizon-Offline-Launcher.
 uzGcg2Sc1fAl26IpR2jEnhbmRhXTaiTyO9eWc2cpK1E=
+
+# Horizon's own public key: the game's Nightlies also install straight from horizon-rust/horizon.
+MU4oiIQcCxkZvbwSjjXs7SySCuM6ywRQ3nGaJYZG0gw=
+
+# This fork's own key: releases this repository publishes with its own RELEASE_SIGNING_KEY.
+8Bj1DGm/i8RKA/by9Fm6xDrWjrV4nJzVaDE/ipTvGHY=
