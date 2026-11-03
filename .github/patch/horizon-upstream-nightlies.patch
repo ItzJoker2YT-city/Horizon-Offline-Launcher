@@ -1,0 +1,189 @@
+--- a/launcher/src/backend.rs
++++ b/launcher/src/backend.rs
+@@ -11,7 +11,7 @@
+ 
+ /// Game and launcher releases come from this fork (signed with its own key, release-keys.txt),
+ /// never from upstream's `horizon-rust/horizon`: those would bring the account gate back.
+-pub const REPO: &str = "gerdaroot/Horizon-Offline-Launcher";
++pub const REPO: &str = "ItzJoker2YT-city/Horizon-Offline-Launcher";
+ /// Horizon's own repository: native mods' sources and commits this fork doesn't have come from it.
+ pub const UPSTREAM_REPO: &str = "horizon-rust/horizon";
+ pub const README_URL: &str =
+@@ -331,6 +331,22 @@
+     get(&url)?.into_json().map_err(|e| e.to_string())
+ }
+ 
++/// Every published release of Horizon's own repository: where the game's builds come from.
++fn upstream_release_list() -> Result<serde_json::Value, String> {
++    let url = format!("https://api.github.com/repos/{UPSTREAM_REPO}/releases?per_page=100");
++    get(&url)?.into_json().map_err(|e| e.to_string())
++}
++
++/// Horizon's releases joined with this repository's: the Versions page lists the game's builds
++/// from Horizon (its Nightlies) next to this fork's, while the launcher's updates stay here.
++fn merged_release_list() -> Result<serde_json::Value, String> {
++    let mut list = upstream_release_list()?;
++    if let (Some(out), Ok(extra)) = (list.as_array_mut(), release_list()) {
++        out.extend(extra.as_array().cloned().unwrap_or_default());
++    }
++    Ok(list)
++}
++
+ /// The releases in `list` whose tag passes `keep`, newest first, with the asset named `asset`.
+ pub(crate) fn parse_releases(
+     list: &serde_json::Value,
+@@ -378,7 +394,7 @@
+ /// 2026-10-28, docs/release-flow.md), the last week's Nightlies, then the releases from before.
+ /// Drafts never reach the anonymous API, and launcher releases are left out.
+ pub fn releases() -> Result<Vec<Release>, String> {
+-    Ok(game_releases(&release_list()?))
++    Ok(game_releases(&merged_release_list()?))
+ }
+ 
+ /// The game's builds in `list`, newest first. A Nightly is listed under the version it installs as
+@@ -698,8 +714,9 @@
+ }
+ 
+ /// The SHA-256 the release's signed checksums give for `asset`, or why it must not be installed.
+-fn signed_digest(tag: &str, asset: &str) -> Result<String, String> {
+-    crate::signed::digest(
++fn signed_digest(repo: &str, tag: &str, asset: &str) -> Result<String, String> {
++    crate::signed::digest_from(
++        repo,
+         tag,
+         asset,
+         &horizon_release_sign::trusted_keys(),
+@@ -707,6 +724,20 @@
+     )
+ }
+ 
++/// The repository a release's files download from: its asset URL's owner/repo. Horizon's builds
++/// are checked against Horizon's checksums, this fork's against its own.
++fn release_repo(release: &Release) -> String {
++    release
++        .asset
++        .as_ref()
++        .and_then(|(url, _)| {
++            url.strip_prefix("https://github.com/")?
++                .split_once("/releases/download/")
++                .map(|(repo, _)| repo.to_owned())
++        })
++        .unwrap_or_else(|| REPO.to_owned())
++}
++
+ /// Downloads `url` into `to`; the file is kept only if its SHA-256 is `sha256`, the signed (or
+ /// pinned) one. A `size` of 0 takes the server's Content-Length for the progress.
+ pub(crate) fn download(
+@@ -763,15 +794,17 @@
+ /// the fraction done.
+ pub fn install(release: &Release, progress: impl Fn(f32)) -> Result<(), String> {
+     let tag = release.tag.as_str();
++    let repo = release_repo(release);
+     let sha256 = match &release.nightly {
+         // Signed for the Nightly channel, served under its own GitHub tag.
+-        Some(published) => crate::signed::nightly_digest(
++        Some(published) => crate::signed::nightly_digest_from(
++            &repo,
+             published,
+             ASSET.unwrap_or_default(),
+             &horizon_release_sign::trusted_keys(),
+             fetch_small,
+         )?,
+-        None if is_game_tag(tag) => signed_digest(tag, ASSET.unwrap_or_default())?,
++        None if is_game_tag(tag) => signed_digest(&repo, tag, ASSET.unwrap_or_default())?,
+         None => return Err(format!("{tag} is not a Horizon release.")),
+     };
+     install_as(release, tag, &sha256, progress)
+@@ -2585,7 +2618,7 @@
+ pub fn releases_and_updates(
+     on_releases: impl FnOnce(Result<Vec<Release>, String>),
+ ) -> Result<Updates, String> {
+-    releases_and_updates_with(release_list, installed, launcher_releases_in, on_releases)
++    releases_and_updates_with(merged_release_list, installed, launcher_releases_in, on_releases)
+ }
+ 
+ fn releases_and_updates_with(
+@@ -2905,7 +2938,7 @@
+         progress(1.0);
+         return Ok(());
+     }
+-    let sha256 = signed_digest(&release.tag, launcher_asset().unwrap_or_default())?;
++    let sha256 = signed_digest(REPO, &release.tag, launcher_asset().unwrap_or_default())?;
+     let work = data_dir().join(".launcher-update");
+     let _ = fs::remove_dir_all(&work);
+     fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+--- a/launcher/src/signed.rs
++++ b/launcher/src/signed.rs
+@@ -9,7 +9,12 @@
+ 
+ /// Where a release's attached file downloads from (GitHub's fixed address for it).
+ pub fn asset_url(tag: &str, name: &str) -> String {
+-    format!("https://github.com/{REPO}/releases/download/{tag}/{name}")
++    asset_url_from(REPO, tag, name)
++}
++
++/// The same, from a given repository: the game's builds can come from Horizon's own releases.
++pub fn asset_url_from(repo: &str, tag: &str, name: &str) -> String {
++    format!("https://github.com/{repo}/releases/download/{tag}/{name}")
+ }
+ 
+ /// The signed SHA-256 of `asset` in release `tag`, fetching its SHA256SUMS and SHA256SUMS.sig
+@@ -21,11 +26,22 @@
+     keys: &[PublicKey],
+     fetch: impl Fn(&str) -> Result<Option<Vec<u8>>, String>,
+ ) -> Result<String, String> {
++    digest_from(REPO, tag, asset, keys, fetch)
++}
++
++/// [`digest`], from a given repository's releases.
++pub fn digest_from(
++    repo: &str,
++    tag: &str,
++    asset: &str,
++    keys: &[PublicKey],
++    fetch: impl Fn(&str) -> Result<Option<Vec<u8>>, String>,
++) -> Result<String, String> {
+     if let Some(hex) = horizon_release_sign::legacy_digest(tag, asset) {
+         return Ok(hex.to_owned());
+     }
+-    let sums = fetch(&asset_url(tag, SUMS))?;
+-    let signature = fetch(&asset_url(tag, SIGNATURE))?
++    let sums = fetch(&asset_url_from(repo, tag, SUMS))?;
++    let signature = fetch(&asset_url_from(repo, tag, SIGNATURE))?
+         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+     horizon_release_sign::signed_digest(tag, asset, sums.as_deref(), signature.as_deref(), keys)
+ }
+@@ -39,8 +55,19 @@
+     keys: &[PublicKey],
+     fetch: impl Fn(&str) -> Result<Option<Vec<u8>>, String>,
+ ) -> Result<String, String> {
+-    let sums = fetch(&asset_url(tag, SUMS))?;
+-    let signature = fetch(&asset_url(tag, SIGNATURE))?
++    nightly_digest_from(REPO, tag, asset, keys, fetch)
++}
++
++/// [`nightly_digest`], from a given repository's releases.
++pub fn nightly_digest_from(
++    repo: &str,
++    tag: &str,
++    asset: &str,
++    keys: &[PublicKey],
++    fetch: impl Fn(&str) -> Result<Option<Vec<u8>>, String>,
++) -> Result<String, String> {
++    let sums = fetch(&asset_url_from(repo, tag, SUMS))?;
++    let signature = fetch(&asset_url_from(repo, tag, SIGNATURE))?
+         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+     horizon_release_sign::nightly_digest(asset, sums.as_deref(), signature.as_deref(), keys)
+ }
+--- a/crates/horizon-release-sign/release-keys.txt
++++ b/crates/horizon-release-sign/release-keys.txt
+@@ -2,3 +2,9 @@
+ # base64 Ed25519 key per line. The launcher and horizon-server build these in and refuse a download no key here
+ # signed. The private key exists only as the RELEASE_SIGNING_KEY secret of gerdaroot/Horizon-Offline-Launcher.
+ uzGcg2Sc1fAl26IpR2jEnhbmRhXTaiTyO9eWc2cpK1E=
++
++# Horizon's own public key: the game's Nightlies also install straight from horizon-rust/horizon.
++MU4oiIQcCxkZvbwSjjXs7SySCuM6ywRQ3nGaJYZG0gw=
++
++# This fork's own key: releases this repository publishes with its own RELEASE_SIGNING_KEY.
++8Bj1DGm/i8RKA/by9Fm6xDrWjrV4nJzVaDE/ipTvGHY=
